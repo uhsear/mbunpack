@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.coverage
+.coverage.*
+htmlcov/
+*.log
+.env
+*.env
+credentials*
+*token*
