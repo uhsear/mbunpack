@@ -18,10 +18,6 @@ Nobody catches it, because no step fails. Every tool did what it was told. The n
 guess, and the guess was never compared with the file. The section "What mbutil does" reproduces
 each step of this on a one-tile file, with the line of code behind it.
 
-```
-$ python mbunpack.py self-test
-```
-
 This tool reads the first bytes of each tile. A PNG, a JPEG and a WebP have signatures. A gzip
 stream starts with `1f 8b`. A Mapbox Vector Tile has no signature, so the tool parses its
 protobuf structure. The extension it writes says what the bytes are: `.png`, `.jpg`, `.webp`,
@@ -33,7 +29,8 @@ $ python mbunpack.py --self-test
 @@SELFTEST@@
 ```
 
-The full run prints all 127 assertions. Each `...` line above is where this block is cut.
+The full run prints all @@N@@ assertions. Each `...` line above is where this block is cut. The
+lines before and after a cut are copied from the run without change.
 
 ## What already exists
 
@@ -44,28 +41,37 @@ writes UTFGrid data. It knows six directory layouts (`xyz`, `tms`, `wms`, `zyx`,
 an MBTiles file from a folder, mbutil is still the tool that does it, and mbunpack does not.
 mbutil has one habit this tool exists to remove: it never looks at the bytes of a tile.
 
-Three more tools unpack MBTiles files. I read their READMEs and did not run them.
-[amarant/mbutiles](https://github.com/amarant/mbutiles) is a Rust port of mbutil and documents
-the same `--image-format` option with the default `png`.
-[watergis/mbtiles2pbf](https://github.com/watergis/mbtiles2pbf) extracts tiles with a file
-extension that the caller passes in. [Zverik/mbutil2](https://github.com/Zverik/mbutil2) is a
-second rewrite, last pushed in 2017. In each README the extension comes from a setting, not from
-the tile.
+Four more tools read MBTiles files. I read their READMEs on 2026-10-23 and did not run them. I
+did not read their code.
 
-A search of GitHub for `mbunpack` on 2026-10-22 found no repository of that name. A search for
-tools that unpack MBTiles to a folder found the four above. That shows only what the search
-found.
+- [amarant/mbutiles](https://github.com/amarant/mbutiles) is a Rust tool that exports tiles from
+  an MBTiles file. Its README says "Inspired by mbutil" and documents an `--image-format` option
+  with the default `png`.
+- [watergis/mbtiles2pbf](https://github.com/watergis/mbtiles2pbf) extracts tiles with a file
+  extension that the caller passes in, `FileExtension.MVT` in its example.
+- [Zverik/mbutil2](https://github.com/Zverik/mbutil2) says it is "loosely based on original
+  mapbox-mbutil". Its README is two lines, so I know nothing more about it. GitHub gives its
+  last push as 2011-11-19.
+- [maplibre/martin](https://github.com/maplibre/martin) is a tile server, licensed Apache-2.0.
+  Its README says its `mbtiles` tool can examine, copy, validate, compare and apply diffs between
+  MBTiles files. That is a different job from this one, and I do not know what its `validate`
+  checks.
+
+On 2026-10-23 at 05:31 UTC, `gh search repos mbunpack` returned one repository, this one. The
+search `gh search repos "mbtiles unpack"` returned none. I found the tools above by reading the
+results for `mbtiles`. That is not a census, and it shows only what the search found.
 
 ## Requirements
 
 Python 3.9 or newer and nothing else. The standard library covers SQLite, gzip and the
 protobuf wire format. No third-party package, no network, no credentials, no ArcGIS. The only
-formats it relies on are the two public specifications listed under "Specifications relied on".
+formats it relies on are the public specifications listed under "Specifications relied on".
 
-The self-test prints the same 127 assertions on Windows (Python 3.13.2), on Python 3.9.25 and
-on Ubuntu (Python 3.12.3). The three outputs are identical line for line.
+The self-test prints the same @@N@@ assertions on Windows (Python 3.13.2), on Windows Python
+3.9.25 and on Ubuntu (Python 3.12.3). The outputs are identical line for line, apart from the
+carriage return that Windows text mode adds to each line when the output goes to a file.
 `coverage run --branch mbunpack.py --self-test` reports 100 percent of lines and branches on
-Windows and on Ubuntu.
+Windows (Python 3.13.2, coverage 7.16.1) and on Ubuntu (Python 3.12.3, coverage 7.17.0).
 
 ```
 git clone https://github.com/uhsear/mbunpack.git
@@ -98,7 +104,11 @@ without `--apply` is a dry run: it reads every tile, prints the full report and 
 
 `--out` must name a folder that does not exist or is empty. The check runs on a dry run too. A
 folder that holds files is refused with exit 64, and so is a path that is also the source file.
-The MBTiles file is opened read-only, so the run cannot change it or leave a journal beside it.
+
+The MBTiles file is opened read-only and immutable, so SQLite writes no file beside it. That
+holds for a file in WAL journal mode too. A file with a non-empty `-wal` or `-journal` file next
+to it is refused with exit 2, because an immutable open ignores those files and the read would
+miss their changes. Merge them first, on a copy.
 
 A folder source is audited and never written. `--out` and `--decompress` go with an `.mbtiles`
 file, and a folder source with either one is refused with exit 64.
@@ -131,11 +141,27 @@ writes the inflated bytes as `.mvt`. The extension always matches the bytes writ
 | `OK` | The bytes are a format this tool names. | Yes | 0 |
 | `EMPTY` | Zero bytes, or gzip of zero bytes. | No | 0 |
 | `UNKNOWN` | The bytes match no format this tool reads, or are gzip inside gzip. | No | 1 |
-| `CORRUPT` | A gzip stream that is damaged, truncated, followed by extra bytes, or inflates past 64 MiB. Or `tile_data` is NULL or text. | No | 1 |
+| `CORRUPT` | A gzip stream that is damaged, truncated, followed by extra bytes, or inflates past 64 MiB. Or `tile_data` is NULL or text. Or, in a folder, a file larger than 64 MiB or one that cannot be read. | No | 1 |
 | `BADCOORD` | The zoom, column or row is not an integer, or is not a cell of the grid at that zoom. | No | 1 |
-| `DUPLICATE` | A second row for an address. The later row is skipped. | No | 1 |
+| `DUPLICATE` | A second tile for one address. The later one is not used. | No | 1 |
 | `MISNAMED` | Folder audit only. The file name disagrees with its bytes. | n/a | 1 |
-| `SKIPPED` | Folder audit only. The path is not `z/x/y.ext`, so it was not read. | n/a | 0 |
+| `SKIPPED` | Folder audit only. The path is not `z/x/y.ext`, or the entry is a link or special file. It was not read. | n/a | 0 |
+
+`EMPTY` and `SKIPPED` do not make the run exit 1. The report counts them, and the verdict line
+no longer says that every tile was identified when some were not. A folder with one good tile,
+two zero-byte files and one retina-named file ends like this:
+
+```
+EMPTY 2: zero-byte tile, there is nothing to write
+    1/0/1.png
+    1/1/0.png
+SKIPPED 1: not z/x/y.ext, or a link or special file, so it was not read
+    1/1/1@2x.png
+VERDICT: 1 of 4 file(s) were identified from their bytes. Not identified, and not counted as a finding: 2 EMPTY, 1 SKIPPED.
+```
+
+A scheduled job that reads only the exit code does not see that line. Read the report, or watch
+for the word `SKIPPED` or `EMPTY` in it.
 
 A tile that is `OK` can still disagree with the metadata. The MBTiles specification says the
 `format` row `pbf` means gzip-compressed vector tiles. So a tileset that says `pbf` and holds
@@ -149,6 +175,22 @@ everything after the first dot, compared exactly with the extension this tool wo
 `2/1/2.png` holding gzip is `MISNAMED`, a bare `2/1/2.pbf` is `MISNAMED` whether or not it is
 gzipped, `2/1/2.pbf.gz` holding a PNG is `MISNAMED`, and a file with no extension at all is
 `MISNAMED` too. A folder this tool wrote audits clean.
+
+A second file at one address is a `DUPLICATE`, whatever its extension or zero padding. So
+`3/1/1.png` and `3/1/1.jpg` in one folder exit 1, and so do `2/1/2.png` and `2/1/02.png`.
+
+The audit opens only regular files. A symbolic link, a FIFO or other special file, and any file
+whose folder resolves outside the audited folder (a Windows junction does this) is listed under
+`SKIPPED` and is never opened. A link to a folder is listed and not entered. Audit the target as
+its own folder if you want its tiles read. A FIFO named like a tile does not stop the run, and a
+link to a file outside the folder cannot put that file's bytes in the report.
+
+A file that cannot be read is `CORRUPT` and named, and the files before it still count. A file
+larger than 64 MiB is `CORRUPT` and is not read past that size.
+
+Every name and metadata value is printed with its control characters shown as `\xNN`. A folder
+that holds a file named with escape codes cannot move the cursor or set the title of your
+terminal.
 
 ## What mbutil does
 
@@ -185,12 +227,16 @@ folder mbutil wrote, the audit says:
 ```
 $ python mbunpack.py out_default
 mbunpack: out_default: 2 file(s) read
+identified from the bytes:
+  mvt (gzip)     1
 MISNAMED 1: file name disagrees with the bytes inside it
     2/1/2.png  bytes are mvt (gzip), the name ends .png, expected .mvt.gz
-SKIPPED 1: path is not z/x/y.ext, so it was not read
+SKIPPED 1: not z/x/y.ext, or a link or special file, so it was not read
     metadata.json
 VERDICT: 1 finding(s) in 2 file(s).
 ```
+
+@@AUDIT_NOTE@@
 
 That run exits 1. The audit is the check to run before a folder goes back into mbutil's import,
 or onto a file host. Rows 2 to 4 are why: the import cannot tell a name it rejects from a tile
@@ -213,20 +259,35 @@ mbunpack has no import. It does not build MBTiles files.
   `Layer.extent` 5. This is why `.mvt` is the extension, and the structure test follows the proto.
   The specification names no magic number, and the tool does not claim one.
 - [SQLite URI filenames](https://www.sqlite.org/uri.html). The query parameter `mode=ro` opens
-  the database read-only. The fragment after `#` is ignored, and `%HH` escapes may appear in the
-  path. This is why the path is percent-encoded before it becomes a URI. A directory name that
-  holds `#` is otherwise cut short at the `#`.
+  the database read-only. The query parameter `immutable=1` tells SQLite that the file cannot
+  change, and SQLite then "skips all file locking and change detection". The fragment after `#`
+  is ignored, and `%HH` escapes may appear in the path. This is why the path is percent-encoded
+  before it becomes a URI. A directory name that holds `#` is otherwise cut short at the `#`.
+- [SQLite write-ahead logging, section 5](https://www.sqlite.org/wal.html). A WAL-mode database
+  can be read without write permission when its `-shm` and `-wal` files exist, when the folder
+  is writable so they can be created, or when the connection uses `immutable`. A plain read-only
+  open therefore creates those two files beside the database. The immutable open does not, and
+  it does not read the `-wal` file, which is why a non-empty one is refused.
+- [RFC 1952](https://www.rfc-editor.org/rfc/rfc1952.txt), section 2.2. "A gzip file consists
+  of a series of members". This tool reads one member, so a second member is reported as bytes
+  after the end of the stream. See Limits.
 - [Python zlib](https://docs.python.org/3/library/zlib.html). `decompressobj.decompress` with a
   `max_length` returns at most that many bytes and keeps the rest in `unconsumed_tail`. This is
   how a gzip bomb is refused and not inflated.
+- [Python integer string conversion limit](https://docs.python.org/3/library/stdtypes.html#int-max-str-digits).
+  From Python 3.11, `int()` of a string of more than 4300 digits raises `ValueError`. This is why
+  a run of more than 20 digits in a tile name is never passed to `int()`.
+- [Python os.walk](https://docs.python.org/3/library/os.html#os.walk). By default it does not
+  walk down into symbolic links that resolve to directories. They still appear in the list of
+  directories, which is how the audit finds and reports them.
 
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
-| 0 | At least one tile was identified, and no tile has a finding. |
+| 0 | At least one tile was identified, and no tile has a finding. `EMPTY` and `SKIPPED` files are not findings, and the verdict line counts them. |
 | 1 | At least one finding: `UNKNOWN`, `CORRUPT`, `BADCOORD`, `DUPLICATE`, `MISNAMED`, or a `DECLARED` disagreement. |
-| 2 | A file could not be read or written: a missing path, a file that is not SQLite, no `tiles` table, or a folder that cannot be made. |
+| 2 | A file could not be read or written: a missing path, a file that is not SQLite, no `tiles` table, a `-wal` or `-journal` file with changes in it, or a folder that cannot be made. |
 | 4 | Nothing was compared. No tile was identified, or the tileset or folder holds no tile. |
 | 64 | A usage error. This includes an abbreviated flag. |
 | 70 | An unexpected crash. This is a fault in the tool and never a finding. |
@@ -242,33 +303,63 @@ has also proved nothing.
 - It names four formats: PNG, JPEG, WebP and Mapbox Vector Tile, each plain or in gzip. A GIF,
   a TIFF, a zlib-compressed tile or a vector tile of another kind is `UNKNOWN`. The `grids` and
   `grid_data` tables of UTFGrid data are not read.
+- A vector tile whose top-level message carries a field other than the layer list is named
+  `UNKNOWN`, because every byte must belong to field 3.
+- A gzip file made of two or more members joined together is `CORRUPT`, because only the first
+  member is read and the rest counts as trailing bytes. RFC 1952 allows such a file, and
+  browsers accept it.
 - An `UNKNOWN`, `CORRUPT`, `BADCOORD` or `DUPLICATE` tile is counted and listed and not written.
   There is no option to write it under a guessed name.
+- A `format` row spelled `jpeg`, written as an IETF media type, or stored as a BLOB is compared
+  with no tile. The report says that the format is not read. The run can still exit 0, with every
+  tile identified, even when the tiles disagree with that spelling.
 - The folder audit is strict by design. The extension must equal what this tool would write,
   exactly and in lower case. A folder from any tool that keeps gzip under a bare `.pbf` is
   flagged, because a file host must then send `Content-Encoding: gzip` for it to work. If your
   host does send it, the flag is a note and not a fault.
-- The ceiling of zoom 30 is this tool's own limit, and the specification sets none. It stops a
-  corrupt `zoom_level` from sizing a huge grid. A gzip stream that inflates past 64 MiB is
-  `CORRUPT`. No real tile does.
-- Duplicate addresses are found when two rows sit next to each other in the sorted order. The
-  query sorts by zoom, column and row. A tileset with the unique index from the specification
-  cannot hold a duplicate. A view or a table without the index can.
-- The sort reads the whole `tiles` table once. Timing from one run on one Windows workstation:
-  20,000 synthetic tiles took 5.5 seconds to check and 17 seconds to unpack. Your disk will
+- The folder audit accepts zero-padded names. `02/001/002.png` is read as the cell 2/1/2 and can
+  be `OK`. It finds a duplicate only when a second file has the same cell.
+- A part of a tile path with more than 20 digits is not a tile name, and the file is `SKIPPED`.
+- The folder audit keeps every address it has seen in memory, and it reads each file whole, up to
+  64 MiB. A folder of many millions of tiles needs memory to match.
+- The audit does not follow a link. A folder that is reached only through a link, or a junction
+  that points outside, is not read, and its tiles do not count. It exits 0 if nothing else is
+  wrong. The report lists the link under `SKIPPED`.
+- The zoom ceiling of 30 is this tool's own limit, and the specification sets none. It stops a
+  corrupt `zoom_level` from sizing a huge grid. The 64 MiB inflate limit is a limit this tool
+  chose too. A gzip stream that inflates past it is `CORRUPT`.
+- Tiles in a tileset are checked for a duplicate when two rows sit next to each other in the
+  sorted order. The query sorts by zoom, column and row. A tileset with the unique index from the
+  specification cannot hold a duplicate. A view or a table without the index can. The check
+  compares the raw values with `==`, so a `True` or `1.0` in `tile_column` equals `1` and is
+  reported as `DUPLICATE`, not as `BADCOORD`.
+- The sort reads the whole `tiles` table once. Timing from one run on one Windows workstation,
+  with 20,000 synthetic gzipped vector tiles at zooms 8 to 10: @@T_CHECK@@ seconds to check and
+  @@T_UNPACK@@ seconds to unpack. This is a single run and not a benchmark. Your disk will
   differ. A tileset of millions of tiles is slow and the tool prints no progress.
 - A write that fails part-way, such as a full disk, exits 2 and leaves the files written so far.
-  Delete the folder and run again.
+  The self-test makes the metadata write fail and checks that the three tile files stay. Delete
+  the folder and run again.
+- Do not point the tool at an MBTiles file that another program is writing. SQLite documents that
+  an immutable open of a file that changes can return wrong results.
 - Only the `tiles` and `metadata` tables are read. A file with no `metadata` table is read and
   reports no declared format. The MBTiles specification requires that table, so such a file is
   not valid, and the tool does not say so.
 - A metadata row with a NULL name is written to `metadata.json` under the key `None`.
+- Run as `python mbunpack.py tiles | head -1`, a closed pipe raises `BrokenPipeError`, and the
+  tool prints a traceback and exits 70. Read the whole report instead of cutting it with `head`.
 - No Esri behaviour is relied on, and none is tested. Vector tile packages from ArcGIS are a
   different format and are not read.
 - The `metadata.json` it writes is plain JSON of the table. It is not a promise that another
   importer will read it.
+- The link assertion in the self-test makes a symbolic link to a file and one to a folder. A
+  host that does not allow links runs the same assertion with no links, and it proves less. The
+  Windows host that made the quoted run allowed links. The FIFO case is not in the self-test,
+  because a regression would hang the run. It is covered by the pure `may_read` function, and I
+  ran it once by hand on Ubuntu with a FIFO named `1/0/1.png`, under `timeout 5`.
 - Nothing in this tool needs the network or a credential, so there is no network path to test
-  against a stub, and no credential can reach its output.
+  against a stub. The only file bytes it can print are the first eight bytes of an `UNKNOWN` tile
+  inside the folder you named.
 
 ## Contributing
 

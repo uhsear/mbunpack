@@ -21,7 +21,9 @@ Given an .mbtiles file it reports the formats it found, compares them with the
 format row in the metadata table, and writes a z/x/y directory only with
 --apply. Given a directory it only reads: every z/x/y.ext file whose name
 disagrees with its bytes is listed. Nothing else writes. The MBTiles file is
-opened read-only.
+opened read-only and immutable, so SQLite makes no -wal, -shm or journal file
+beside it. A symbolic link or special file in a folder is listed and never
+opened.
 
 Exit codes: 0 every tile was identified from its bytes and none disagrees with
 the declared format, 1 at least one tile is unknown, damaged, misnamed, off the
@@ -43,6 +45,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import struct
 import subprocess
 import sys
@@ -87,9 +90,9 @@ MEANING = {
     UNKNOWN: "bytes match no format mbunpack reads",
     CORRUPT: "the bytes cannot be read",
     BADCOORD: "tile address is not a cell of the tile grid",
-    DUPLICATE: "same address as the row before it, the later copy is skipped",
+    DUPLICATE: "a second tile for one address, the later copy is not used",
     MISNAMED: "file name disagrees with the bytes inside it",
-    SKIPPED: "path is not z/x/y.ext, so it was not read",
+    SKIPPED: "not z/x/y.ext, or a link or special file, so it was not read",
 }
 
 DEFAULT_SCHEME = "xyz"
@@ -101,8 +104,9 @@ DEFAULT_SAMPLE = 10
 # integer. A tile above it is BADCOORD.
 MAX_ZOOM = 30
 
-# No real tile inflates to this much. A gzip bomb is refused instead of
-# inflated.
+# The most one tile may inflate to, and the most one tile file may hold. It is
+# the limit this tool chose. A gzip bomb is refused instead of inflated, and a
+# larger file is refused instead of read whole.
 MAX_INFLATED = 64 * 1024 * 1024
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -113,7 +117,12 @@ GZIP_MAGIC = b"\x1f\x8b"
 _LAYER_WIRE = {1: 2, 2: 2, 3: 2, 4: 2, 5: 0, 15: 0}
 _TILE_LAYER_TAG = (3 << 3) | 2
 
-_DIGITS = re.compile(r"[0-9]+\Z")
+# A grid cell has at most ten digits (2 ** 30 - 1). A longer run of digits
+# cannot be a tile name, and int() on thousands of digits raises ValueError on
+# Python 3.11 and later, so the run is bounded before int() sees it.
+MAX_DIGITS = 20
+_DIGITS = re.compile(r"[0-9]{1,%d}\Z" % MAX_DIGITS)
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
 class Sniff(object):
@@ -138,6 +147,12 @@ class Item(object):
         self.kind = kind
         self.gzip = gzipped
         self.detail = detail
+
+
+def clean(text):
+    """text with each control character shown as \\xNN, so a hostile file name
+    or metadata value cannot move the cursor or set a title in a terminal."""
+    return _CONTROL.sub(lambda m: "\\x%02x" % ord(m.group()), text)
 
 
 def _varint(buf, pos):
@@ -211,7 +226,7 @@ def is_mvt(data):
             pos = end
     except ValueError:
         return False
-    return len(data) > 0
+    return bool(data)
 
 
 def _sniff_raw(data, gzipped):
@@ -324,8 +339,8 @@ def _tile_address(parts):
 
 def classify_file(parts, reader, limit=MAX_INFLATED):
     """Decide one file of an unpacked tree. parts is its path below the root,
-    split into names. reader() returns its bytes and is not called for a path
-    that is not a tile or is off the grid."""
+    split into names. reader() returns its bytes, at most limit + 1 of them,
+    and is not called for a path that is not a tile or is off the grid."""
     where = "/".join(parts)
     address = _tile_address(parts)
     if address is None:
@@ -334,7 +349,16 @@ def classify_file(parts, reader, limit=MAX_INFLATED):
     why = _address_problem(z, x, y)
     if why:
         return Item(BADCOORD, where, detail=why)
-    found = sniff(reader(), limit)
+    try:
+        data = reader()
+    except OSError as exc:
+        return Item(CORRUPT, where, detail="could not be read (%s)"
+                    % (exc.strerror or type(exc).__name__))
+    if len(data) > limit:
+        return Item(CORRUPT, where,
+                    detail="file is larger than %d bytes, so it was not read "
+                           "whole" % limit)
+    found = sniff(data, limit)
     if found.kind not in EXT:
         return Item(found.kind, where, kind=found.kind, gzipped=found.gzip,
                     detail=found.detail)
@@ -366,7 +390,7 @@ class Report(object):
     def note(self, label, text):
         shown = self.samples.setdefault(label, [])
         if len(shown) < self.sample:
-            shown.append(text)
+            shown.append(clean(text))
 
     def add(self, item):
         self.total += 1
@@ -415,10 +439,24 @@ def unpack(rows, declared, scheme=DEFAULT_SCHEME, decompress=False,
 def audit(entries, read, sample=DEFAULT_SAMPLE, limit=MAX_INFLATED,
           source=""):
     """Classify the files of an unpacked tree. entries yields (parts, path)
-    and read(path) returns the file's bytes."""
+    and read(path) returns the file's bytes. A path of None marks a link or
+    special file, which is listed and never read. A second file at one
+    address, whatever its extension or zero padding, is a DUPLICATE."""
     report = Report("tree", source, None, "", sample)
+    seen = set()
     for parts, path in entries:
-        report.add(classify_file(parts, lambda p=path: read(p), limit))
+        where = "/".join(parts)
+        address = _tile_address(parts)
+        key = address[:3] if address else None
+        if path is None:
+            item = Item(SKIPPED, where, detail="link or special file")
+        elif key is not None and key in seen:
+            item = Item(DUPLICATE, where,
+                        detail="a second file for one address")
+        else:
+            seen.add(key)
+            item = classify_file(parts, lambda p=path: read(p), limit)
+        report.add(item)
     return report
 
 
@@ -445,7 +483,8 @@ def describe(report):
             lines.append("declared format: %s" % report.declared)
         else:
             lines.append("declared format: %s, which mbunpack does not read, "
-                         "so no tile was compared with it" % report.declared)
+                         "so no tile was compared with it"
+                         % clean(report.declared))
     if report.kinds:
         lines.append("identified from the bytes:")
         for (kind, gzipped), count in sorted(report.kinds.items()):
@@ -469,9 +508,20 @@ def describe(report):
         lines.append("VERDICT: %d finding(s) in %d %s."
                      % (report.findings(), report.total, unit))
     else:
-        lines.append("VERDICT: every tile was identified from its bytes%s."
-                     % (" and agrees with the declared format"
-                        if report.declared in KNOWN_FORMATS else ""))
+        agrees = report.declared in KNOWN_FORMATS
+        unread = ["%d %s" % (report.counts[s], s) for s in (EMPTY, SKIPPED)
+                  if report.counts[s]]
+        if unread:
+            lines.append("VERDICT: %d of %d %s were identified from their "
+                         "bytes%s. Not identified, and not counted as a "
+                         "finding: %s."
+                         % (report.counts[OK], report.total, unit,
+                            " and agree with the declared format"
+                            if agrees else "", ", ".join(unread)))
+        else:
+            lines.append("VERDICT: every tile was identified from its "
+                         "bytes%s." % (" and agrees with the declared format"
+                                       if agrees else ""))
     return lines
 
 
@@ -480,11 +530,22 @@ def describe(report):
 # =============================================================================
 
 def open_readonly(path):
-    """Open an MBTiles file so that nothing can write to it. The path is made
-    a URI, so characters such as # and ? in a directory name stay in the path
-    and do not start a fragment or a query."""
-    uri = "file:%s?mode=ro" % urllib.request.pathname2url(
-        os.path.abspath(path))
+    """Open an MBTiles file so that nothing can write to it, and so that
+    SQLite makes no file beside it. mode=ro alone still creates a -wal and a
+    -shm file next to a WAL-mode database. immutable=1 stops that, and it also
+    makes SQLite ignore a -wal or -journal file, so a non-empty one is refused
+    here: its changes would be missing from the read. The path is made a URI,
+    so characters such as # and ? in a directory name stay in the path and do
+    not start a fragment or a query."""
+    full = os.path.abspath(path)
+    for suffix in ("-wal", "-journal"):
+        side = full + suffix
+        if os.path.exists(side) and os.path.getsize(side):
+            raise OSError("%s holds changes that are not in %s. mbunpack "
+                          "reads the main file only and writes nothing, so "
+                          "merge them first, with the sqlite3 shell on a "
+                          "copy." % (side, full))
+    uri = "file:%s?mode=ro&immutable=1" % urllib.request.pathname2url(full)
     return sqlite3.connect(uri, uri=True)
 
 
@@ -507,19 +568,38 @@ def declared_format(meta):
     return None if value is None else str(value).strip().lower()
 
 
+def may_read(mode, folder_real, top):
+    """True when an entry is a regular file, not a link, in a folder whose
+    real path is top or below it. mode is the st_mode of lstat, top ends in a
+    separator. A folder reached through a Windows junction fails the second
+    test, because its real path leaves the tree."""
+    return stat.S_ISREG(mode) and (folder_real + os.sep).startswith(top)
+
+
 def tree_entries(root):
-    """(parts, path) for every file below root, in a fixed order."""
+    """(parts, path) for every entry below root, in a fixed order. path is
+    None for a symbolic link, a special file or a file outside the tree, which
+    must not be opened: a FIFO would block the read and a link would read a
+    file the folder does not hold."""
+    top = os.path.join(os.path.normcase(os.path.realpath(root)), "")
     for folder, dirs, files in os.walk(root):
         dirs.sort()
-        for name in sorted(files):
+        real = os.path.normcase(os.path.realpath(folder))
+        linked = [d for d in dirs
+                  if os.path.islink(os.path.join(folder, d))]
+        for name in sorted(files + linked):
             path = os.path.join(folder, name)
             rel = os.path.relpath(path, root)
-            yield rel.split(os.sep), path
+            mode = os.lstat(path).st_mode
+            yield rel.split(os.sep), (path if may_read(mode, real, top)
+                                      else None)
 
 
-def read_file(path):
+def read_file(path, cap=MAX_INFLATED + 1):
+    """The first cap bytes of a file. The default is one byte more than a tile
+    may hold, so classify_file can tell a file at the limit from one over it."""
     with open(path, "rb") as handle:
-        return handle.read()
+        return handle.read(cap)
 
 
 def make_sink(out):
@@ -715,6 +795,19 @@ def _self_test(tmp):
           and sniff(bomb).kind == UNKNOWN,
           "a gzip stream that inflates past the limit is refused, not "
           "inflated")
+    refused = (sniff(whole[:-5]), sniff(bytes(flipped)),
+               sniff(whole + b"junk"), sniff(bomb, 1000),
+               sniff(_gz(_gz(FIXTURE_PNG))))
+    check(all(r.gzip for r in refused),
+          "every gzip refusal still says the bytes were gzip")
+    block = b"".join(hashlib.sha256(b"%d" % i).digest() for i in range(640))
+    far = sniff(_gz(PNG_SIGNATURE + block + block))
+    check(far.kind == PNG and far.payload.endswith(block + block),
+          "a gzip back-reference more than 16 KiB away inflates, the window "
+          "is the full 32 KiB")
+    members = sniff(whole + whole)
+    check(members.kind == CORRUPT and "%d byte(s) follow" % len(whole) in members.detail,
+          "two gzip members back to back are CORRUPT, only one is read")
 
     # ---- the vector tile structure test
     check(is_mvt(_tile(_layer())), "one named layer is a vector tile")
@@ -757,6 +850,30 @@ def _self_test(tmp):
     check(not is_mvt(_tile(b"\x0a\x01a\x78")),
           "a layer that ends inside a varint is not a vector tile")
     check(not is_mvt(b""), "zero bytes are not a vector tile")
+    check(_varint(_enc(300), 0) == (300, 2)
+          and _varint(_enc(2 ** 63), 0) == (2 ** 63, 10),
+          "a varint of two bytes and one of ten bytes decode to their value  "
+          "<-- pinned defect")
+    raises(lambda: _varint(b"\x80" * 10 + b"\x00", 0),
+           "an eleven byte varint is refused at the tenth byte  "
+           "<-- pinned defect")
+    big = _tile(_layer(name=b"x" * 300), _layer(name=b"y" * 130))
+    check(sniff(big).kind == MVT and sniff(_gz(big)).kind == MVT,
+          "layers whose lengths need two varint bytes are read  "
+          "<-- pinned defect")
+    check(is_mvt(_tile(_layer(extra=b"\x12\x00\x1a\x00\x22\x00"))),
+          "a layer with a feature, a key and a value of length zero parses")
+    wrong = all(not is_mvt(_tile(_layer(extra=bytes([(f << 3) | w, 0]))))
+                for f, w in ((1, 0), (2, 0), (3, 0), (4, 0), (5, 2),
+                             (15, 2)))
+    check(wrong,
+          "each layer field with the wrong wire type is not a vector tile  "
+          "<-- pinned defect")
+    check(is_mvt(_tile(_layer(name=b"a"))),
+          "a layer named by one byte is a vector tile  <-- pinned defect")
+    ext = _tile(_layer()) + b"\x82\x01\x00"
+    check(not is_mvt(ext) and sniff(ext).kind == UNKNOWN,
+          "a tile with a top-level field other than the layers is UNKNOWN")
 
     # ---- one MBTiles row
     def tile(z, col, row, data, **kw):
@@ -853,11 +970,31 @@ def _self_test(tmp):
           "no tiles, or only empty ones, gate to exit 4, not 0")
     check(gate(verdict("png", FIXTURE_PNG)) == 0,
           "a clean tileset gates to exit 0")
+    twin = unpack(rows((1, 1, 1, FIXTURE_PNG), (1, True, 1, FIXTURE_PNG)),
+                  "png")
+    check(twin.counts[DUPLICATE] == 1 and twin.counts[BADCOORD] == 0,
+          "a True in tile_column compares equal to 1 and is DUPLICATE, not "
+          "BADCOORD")
+    check(declared_format({"format": b"png"}) == "b'png'"
+          and verdict("b'png'", FIXTURE_PNG).declared_bad == 0
+          and gate(verdict("jpeg", FIXTURE_PNG)) == 0,
+          "a format stored as a BLOB, or spelled jpeg, is compared with "
+          "nothing and the run still exits 0")
 
     # ---- the examples are capped
     many = unpack(rows(*[(3, 0, i, b"x") for i in range(5)]), None, sample=2)
     check(len(many.samples[UNKNOWN]) == 2 and many.counts[UNKNOWN] == 5,
           "--sample caps the examples and not the count")
+    dozen = unpack(rows(*[(4, 0, i, b"x") for i in range(12)]), None)
+    check(len(dozen.samples[UNKNOWN]) == DEFAULT_SAMPLE == 10
+          and dozen.counts[UNKNOWN] == 12 and MAX_INFLATED == 64 * 2 ** 20,
+          "ten examples are listed by default, and the inflate limit is "
+          "64 MiB")
+    kept = []
+    unpack(rows((1, 0, 0, _gz(FIXTURE_MVT))), "pbf",
+           sink=lambda rel, data: kept.append(rel))
+    check(kept == ["1/0/1.mvt.gz"],
+          "unpack keeps a gzipped tile gzipped unless it is told to inflate")
     none = unpack(rows((3, 0, 0, b"x")), None, sample=0)
     check(none.samples[UNKNOWN] == [] and none.counts[UNKNOWN] == 1,
           "--sample 0 lists no example")
@@ -895,6 +1032,10 @@ def _self_test(tmp):
                     "2/1/x.png": b"", "2/1/2/3.png": b""})
     check(skipped.counts[SKIPPED] == 5 and gate(skipped) == 4,
           "paths that are not z/x/y.ext are SKIPPED and compare nothing")
+    check(tree({"2/x/3.png": b""}).counts[SKIPPED] == 1
+          and tree({"2/x/3.png": b""}).counts[EMPTY] == 0,
+          "a middle part that is not digits is SKIPPED, not a crash  "
+          "<-- pinned defect")
     check(tree({"2/9/0.png": FIXTURE_PNG}).counts[BADCOORD] == 1
           and tree({"2/1/2.png": b"hello"}).counts[UNKNOWN] == 1
           and tree({"2/1/2.png": b""}).counts[EMPTY] == 1,
@@ -906,6 +1047,49 @@ def _self_test(tmp):
     check(unread == [], "a file off the grid is not read")
     check(tree({"2/1/2.PNG": FIXTURE_PNG}).counts[MISNAMED] == 1,
           "the extension is compared exactly, .PNG is not .png")
+    dups = tree({"3/1/1.png": FIXTURE_PNG, "3/1/1.jpg": FIXTURE_JPG,
+                 "3/1/01.png": FIXTURE_PNG, "3/1/2.png": FIXTURE_PNG})
+    check(dups.counts[OK] == 2 and dups.counts[DUPLICATE] == 2
+          and gate(dups) == 1,
+          "a second file at one address is DUPLICATE whatever its extension "
+          "or zero padding  <-- pinned defect")
+    long_names = tree({"0/0/" + "9" * 5000 + ".png": FIXTURE_PNG,
+                       "0/0/" + "9" * 21 + ".png": FIXTURE_PNG,
+                       "0/0/" + "9" * 20 + ".png": FIXTURE_PNG})
+    check(long_names.counts[SKIPPED] == 2
+          and long_names.counts[BADCOORD] == 1,
+          "a name of thousands of digits is SKIPPED and never reaches int(), "
+          "twenty digits are BADCOORD  <-- pinned defect")
+
+    def unreadable():
+        raise OSError(13, "Permission denied")
+
+    denied = classify_file(["2", "1", "2.png"], unreadable)
+    check(denied.status == CORRUPT and "Permission denied" in denied.detail
+          and "OSError" in classify_file(
+              ["2", "1", "2.png"], lambda: (_ for _ in ()).throw(
+                  OSError("boom"))).detail,
+          "a file that cannot be read is CORRUPT and named, and the files "
+          "before it still count  <-- pinned defect")
+    over = classify_file(["2", "1", "2.png"], lambda: FIXTURE_PNG, limit=10)
+    check(over.status == CORRUPT and "larger than 10 bytes" in over.detail
+          and classify_file(["2", "1", "2.png"], lambda: FIXTURE_PNG,
+                            limit=len(FIXTURE_PNG)).status == OK,
+          "a file past the limit is refused, one at the limit is read  "
+          "<-- pinned defect")
+    check(may_read(stat.S_IFREG | 0o644, os.sep + "t", os.sep + "t" + os.sep)
+          and may_read(stat.S_IFREG | 0o644, os.sep.join(["", "t", "a"]),
+                       os.sep + "t" + os.sep),
+          "a regular file in the tree may be read")
+    check(not may_read(stat.S_IFLNK | 0o777, os.sep + "t", os.sep + "t" + os.sep)
+          and not may_read(stat.S_IFIFO | 0o600, os.sep + "t",
+                           os.sep + "t" + os.sep)
+          and not may_read(stat.S_IFREG | 0o644, os.sep + "tx",
+                           os.sep + "t" + os.sep)
+          and not may_read(stat.S_IFREG | 0o644, os.sep + "other",
+                           os.sep + "t" + os.sep),
+          "a link, a FIFO, and a file in a folder outside the tree may not "
+          "be read  <-- pinned defect")
 
     # ---- the report as text
     text = "\n".join(describe(unpack(
@@ -932,6 +1116,35 @@ def _self_test(tmp):
           and "which mbunpack does not read" in "\n".join(
               describe(verdict("image/tiff", FIXTURE_PNG))),
           "a missing or unreadable declared format is said in words")
+    gone = "\n".join(describe(unpack(
+        rows((1, 0, 0, FIXTURE_PNG), (1, 0, 1, b"")), "png")))
+    check("EMPTY 1: zero-byte tile, there is nothing to write" in gone
+          and "VERDICT: 1 of 2 tile(s) were identified from their bytes and "
+          "agree with the declared format. Not identified, and not counted "
+          "as a finding: 1 EMPTY." in gone
+          and "every tile was identified" not in gone,
+          "the verdict counts an EMPTY row and no longer says every tile was "
+          "identified  <-- pinned defect")
+    holes = "\n".join(describe(tree({
+        "2/1/2.png": FIXTURE_PNG, "2/1/3.png": b"",
+        "2/1/4@2x.png": FIXTURE_PNG})))
+    check("VERDICT: 1 of 3 file(s) were identified from their bytes. Not "
+          "identified, and not counted as a finding: 1 EMPTY, 1 SKIPPED."
+          in holes,
+          "the verdict of a folder counts its EMPTY and SKIPPED files  "
+          "<-- pinned defect")
+    check(clean("a\x1b[31mb\x07\x9bc 2/1/2.png")
+          == "a\\x1b[31mb\\x07\\x9bc 2/1/2.png",
+          "clean() shows each control character as \\xNN and keeps the rest")
+    hostile = "\n".join(describe(tree({
+        "2/1/2.\x1b[2Jpng": FIXTURE_PNG, "2/1/x\x1b]0;t\x07": b""})))
+    check("\x1b" not in hostile and "\x07" not in hostile
+          and "the name ends .\\x1b[2Jpng" in hostile,
+          "a file name with escape codes is printed with them shown, not "
+          "obeyed  <-- pinned defect")
+    check("\x1b" not in "\n".join(describe(verdict("\x1b[2J", FIXTURE_PNG))),
+          "a metadata value with escape codes is printed with them shown  "
+          "<-- pinned defect")
     check("VERDICT: nothing was compared. 0 tile(s) read"
           in "\n".join(describe(unpack(rows(), "png"))),
           "a run that compared nothing says so")
@@ -967,7 +1180,9 @@ def _self_test(tmp):
         and written["2/1/1.mvt.gz"] == _gz(FIXTURE_MVT),
         "--apply writes z/x/y.mvt.gz files holding the stored bytes, and "
         "metadata.json")
-    check(json.loads(written["metadata.json"].decode("utf-8"))
+    check(written["metadata.json"].decode("utf-8").replace("\r\n", "\n")
+          == '{\n  "format": "pbf",\n  "name": "synthetic"\n}'
+          and json.loads(written["metadata.json"].decode("utf-8"))
           == {"name": "synthetic", "format": "pbf"}
           and "wrote 3 tile(s)" in stdout,
           "metadata.json holds the metadata table, and the run says how "
@@ -977,6 +1192,59 @@ def _self_test(tmp):
           and "MISNAMED" not in stdout,
           "an unpacked directory audits clean, and metadata.json is skipped "
           "without being a finding")
+
+    def put(root, rel, data):
+        path = os.path.join(root, *rel.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(data)
+
+    zeros = fresh("zeros")
+    for rel, data in (("1/0/0.png", FIXTURE_PNG), ("1/0/1.png", b""),
+                      ("1/1/0.png", b""), ("1/1/1@2x.png", FIXTURE_PNG)):
+        put(zeros, rel, data)
+    code, stdout, stderr = run_cli([zeros])
+    check(code == 0 and "EMPTY 2" in stdout and "SKIPPED 1" in stdout
+          and "VERDICT: 1 of 4 file(s) were identified from their bytes. "
+          "Not identified, and not counted as a finding: 2 EMPTY, 1 SKIPPED."
+          in stdout,
+          "a folder of empty and retina-named files exits 0 and the verdict "
+          "does not call it fully identified  <-- pinned defect")
+    twins = fresh("twins")
+    put(twins, "3/1/1.png", FIXTURE_PNG)
+    put(twins, "3/1/1.jpg", FIXTURE_JPG)
+    code, stdout, stderr = run_cli([twins])
+    check(code == 1 and "DUPLICATE 1" in stdout,
+          "a folder that holds one address twice exits 1  "
+          "<-- pinned defect")
+
+    outside = fresh("outside.txt")
+    with open(outside, "w") as handle:
+        handle.write("SECRET-OUTSIDE-THE-FOLDER")
+    outdir = fresh("outdir")
+    put(outdir, "0/0/0.png", FIXTURE_PNG)
+    linked = fresh("linked")
+    put(linked, "1/0/0.png", FIXTURE_PNG)
+    made = []
+    # The third entry names a file that exists, so os.symlink fails on every
+    # host, as it does where links are not allowed. That run still audits.
+    for rel, target, is_dir in (("1/0/1.png", outside, False),
+                                ("2", outdir, True),
+                                ("1/0/0.png", outside, False)):
+        try:
+            os.symlink(target, os.path.join(linked, *rel.split("/")),
+                       target_is_directory=is_dir)
+            made.append(rel)
+        except (OSError, NotImplementedError):
+            pass
+    linked_report = audit(tree_entries(linked), read_file)
+    listed = sorted(t.split("  ")[0]
+                    for t in linked_report.samples.get(SKIPPED, []))
+    check(linked_report.counts[OK] == 1 and listed == sorted(made)
+          and linked_report.total == 1 + len(made)
+          and "SECRET" not in "\n".join(describe(linked_report)),
+          "a symbolic link to a file or a folder is listed and never read; "
+          "this host made %d link(s)  <-- pinned defect" % len(made))
 
     # The mbutil defect, reproduced as a tree: gzip under .png and .pbf.
     legacy = fresh("legacy")
@@ -999,6 +1267,8 @@ def _self_test(tmp):
     check(run_cli([hollow])[0] == 4,
           "a directory with no tiles exits 4, not 0")
 
+    check(run_cli([mixed, "--sample", "0"])[0] == 0,
+          "--sample 0 is accepted on the command line")
     tms = fresh("tms")
     code, stdout, stderr = run_cli([mixed, "--out", tms, "--scheme", "tms",
                                     "--apply"])
@@ -1067,6 +1337,37 @@ def _self_test(tmp):
     check(code == 2 and stderr.startswith("error:"),
           "a directory that cannot be made exits 2, not a traceback")
 
+    # ---- a WAL-mode source gains no file beside it
+    walled = fresh("walled.mbtiles")
+    _make_mbtiles(walled, [(1, 0, 0, FIXTURE_PNG)], {"format": "png"})
+    con = sqlite3.connect(walled)
+    mode = con.execute("pragma journal_mode=wal").fetchone()[0]
+    con.close()
+    wal_before = hashlib.sha256(read_file(walled)).hexdigest()
+    listing = sorted(os.listdir(tmp))
+    code, stdout, stderr = run_cli([walled])
+    check(mode == "wal" and code == 0 and "1 tile(s) read" in stdout
+          and sorted(os.listdir(tmp)) == listing
+          and hashlib.sha256(read_file(walled)).hexdigest() == wal_before,
+          "a check of a WAL-mode tileset leaves no -wal or -shm file beside "
+          "it  <-- pinned defect")
+    for suffix in ("-wal", "-journal"):
+        pending = fresh("pending.mbtiles")
+        _make_mbtiles(pending, [(1, 0, 0, FIXTURE_PNG)], {"format": "png"})
+        put(os.path.dirname(pending), os.path.basename(pending) + suffix,
+            b"not empty")
+        code, stdout, stderr = run_cli([pending])
+        check(code == 2 and "holds changes that are not in" in stderr
+              and stdout == "",
+              "a non-empty %s file beside the source is refused, because an "
+              "immutable read would miss it" % suffix)
+    quiet_wal = fresh("quiet.mbtiles")
+    _make_mbtiles(quiet_wal, [(1, 0, 0, FIXTURE_PNG)], {"format": "png"})
+    put(os.path.dirname(quiet_wal), os.path.basename(quiet_wal) + "-wal", b"")
+    check(run_cli([quiet_wal])[0] == 0,
+          "an empty -wal file beside the source holds nothing and is "
+          "accepted")
+
     # ---- usage errors, and only --apply writes
     stale = fresh("stale")
     for flag in ("--ap", "--appl", "--app"):
@@ -1133,6 +1434,29 @@ def _self_test(tmp):
     con.close()
     check("readonly" in refusal,
           "the connection mbunpack opens refuses a write")
+
+    # ---- a write that fails part-way keeps what it wrote
+    real_write_metadata = globals()["write_metadata"]
+
+    def disk_full(*args):
+        raise OSError(28, "No space left on device")
+
+    partial = fresh("partial")
+    try:
+        globals()["write_metadata"] = disk_full
+        code, stdout, stderr = run_cli([mixed, "--out", partial, "--apply"])
+    finally:
+        globals()["write_metadata"] = real_write_metadata
+    check(code == 2 and "No space left on device" in stderr
+          and sorted(_tree(partial)) == ["2/1/1.mvt.gz", "2/1/2.mvt.gz",
+                                         "2/2/2.mvt.gz"],
+          "a write that fails after the tiles exits 2 and leaves the files "
+          "already written")
+    got = fresh("cap.bin")
+    with open(got, "wb") as handle:
+        handle.write(b"0123456789")
+    check(read_file(got, 4) == b"0123" and read_file(got) == b"0123456789",
+          "read_file stops at its cap and reads a smaller file whole")
 
     # ---- the console
     calls = []
