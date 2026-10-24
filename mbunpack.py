@@ -22,14 +22,15 @@ format row in the metadata table, and writes a z/x/y directory only with
 --apply. Given a directory it only reads: every z/x/y.ext file whose name
 disagrees with its bytes is listed. Nothing else writes. The MBTiles file is
 opened read-only and immutable, so SQLite makes no -wal, -shm or journal file
-beside it. A symbolic link or special file in a folder is listed and never
-opened.
+beside it. A symbolic link, a junction or a special file in a folder is listed
+and never opened, and a folder that cannot be listed is reported as CORRUPT.
 
 Exit codes: 0 every tile was identified from its bytes and none disagrees with
 the declared format, 1 at least one tile is unknown, damaged, misnamed, off the
 grid, duplicated or disagrees with the metadata, 2 a file could not be read or
-written, 4 nothing was compared (no tile was identified), 64 usage error,
-70 an unexpected crash, which is never a finding.
+written, 4 nothing was compared (no tile was identified, or the format row
+names a format mbunpack does not read), 64 usage error, 70 an unexpected
+crash, which is never a finding.
 """
 
 from __future__ import print_function
@@ -71,6 +72,17 @@ EXT = {PNG: "png", JPEG: "jpg", WEBP: "webp", MVT: "mvt"}
 # Tile is "pbf" there, and the spec says pbf means gzip-compressed.
 FAMILY = {PNG: "png", JPEG: "jpg", WEBP: "webp", MVT: "pbf"}
 KNOWN_FORMATS = ("pbf", "png", "jpg", "webp")
+# Other spellings of a format row that name one of the kinds above. The
+# MBTiles 1.3 spec allows an IETF media type there, and "jpeg" is the common
+# spelling of jpg. This table is this tool's choice, not the spec's.
+FORMAT_ALIASES = {"jpeg": "jpg", "image/png": "png", "image/jpeg": "jpg",
+                  "image/webp": "webp"}
+# A tile file name that is also right for the bytes, beside the extension the
+# tool writes: a JPEG kept under .jpeg.
+NAME_ALIASES = {"jpg": "jpeg", "jpg.gz": "jpeg.gz"}
+# stat.IO_REPARSE_TAG_MOUNT_POINT, the tag of a Windows junction. The stat
+# module defines that name on Windows only, so the number is spelled out.
+JUNCTION_TAG = 0xA0000003
 
 OK = "OK"
 EMPTY = "EMPTY"
@@ -88,7 +100,7 @@ FINDING_STATUSES = (UNKNOWN, CORRUPT, BADCOORD, DUPLICATE, MISNAMED)
 MEANING = {
     EMPTY: "zero-byte tile, there is nothing to write",
     UNKNOWN: "bytes match no format mbunpack reads",
-    CORRUPT: "the bytes cannot be read",
+    CORRUPT: "the bytes, or a folder, cannot be read",
     BADCOORD: "tile address is not a cell of the tile grid",
     DUPLICATE: "a second tile for one address, the later copy is not used",
     MISNAMED: "file name disagrees with the bytes inside it",
@@ -122,7 +134,11 @@ _TILE_LAYER_TAG = (3 << 3) | 2
 # Python 3.11 and later, so the run is bounded before int() sees it.
 MAX_DIGITS = 20
 _DIGITS = re.compile(r"[0-9]{1,%d}\Z" % MAX_DIGITS)
-_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+# C0 and C1 controls, the Unicode line and paragraph separators, and the
+# bidirectional marks, embeddings, overrides and isolates. The last group can
+# reorder or spoof the text around a name in a terminal.
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u200e\u200f\u2028-\u202e"
+                      r"\u2066-\u2069]")
 
 
 class Sniff(object):
@@ -149,10 +165,16 @@ class Item(object):
         self.detail = detail
 
 
+def _shown(match):
+    code = ord(match.group())
+    return ("\\x%02x" if code < 0x100 else "\\u%04x") % code
+
+
 def clean(text):
-    """text with each control character shown as \\xNN, so a hostile file name
-    or metadata value cannot move the cursor or set a title in a terminal."""
-    return _CONTROL.sub(lambda m: "\\x%02x" % ord(m.group()), text)
+    """text with each control or direction-changing character shown as \\xNN
+    or \\uNNNN, so a hostile file name or metadata value cannot move the
+    cursor, set a title or reorder the text around it in a terminal."""
+    return _CONTROL.sub(_shown, text)
 
 
 def _varint(buf, pos):
@@ -301,6 +323,11 @@ def _address_problem(z, col, row):
     return ""
 
 
+def _flip(z, row, scheme):
+    """The y of a stored tile_row: counted from the north under xyz."""
+    return 2 ** z - 1 - row if scheme == "xyz" else row
+
+
 def classify_tile(z, col, row, data, scheme=DEFAULT_SCHEME, decompress=False,
                   limit=MAX_INFLATED):
     """Decide one MBTiles row. MBTiles keeps tile_row in the TMS scheme, y
@@ -313,8 +340,7 @@ def classify_tile(z, col, row, data, scheme=DEFAULT_SCHEME, decompress=False,
         what = "NULL" if data is None else type(data).__name__
         return Item(CORRUPT, "%d/%d/%d" % (z, col, row),
                     detail="tile_data is %s, not a blob" % what)
-    y = 2 ** z - 1 - row if scheme == "xyz" else row
-    where = "%d/%d/%d" % (z, col, y)
+    where = "%d/%d/%d" % (z, col, _flip(z, row, scheme))
     found = sniff(data, limit)
     if found.kind not in EXT:
         return Item(found.kind, where, kind=found.kind, gzipped=found.gzip,
@@ -363,7 +389,7 @@ def classify_file(parts, reader, limit=MAX_INFLATED):
         return Item(found.kind, where, kind=found.kind, gzipped=found.gzip,
                     detail=found.detail)
     expected = tile_ext(found.kind, found.gzip, False)
-    if ext == expected:
+    if ext in (expected, NAME_ALIASES.get(expected)):
         return Item(OK, where, kind=found.kind, gzipped=found.gzip)
     return Item(MISNAMED, where, kind=found.kind, gzipped=found.gzip,
                 detail="bytes are %s, the name ends %s, expected .%s"
@@ -425,7 +451,11 @@ def unpack(rows, declared, scheme=DEFAULT_SCHEME, decompress=False,
     for z, col, row, data in rows:
         address = (z, col, row)
         if address == previous:
-            item = Item(DUPLICATE, "%s/%s/%s" % address,
+            # Named as every other status names a tile, with the flipped y,
+            # when the address is a cell of the grid. An off-grid one has none.
+            where = ("%s/%s/%s" % address if _address_problem(z, col, row)
+                     else "%d/%d/%d" % (z, col, _flip(z, row, scheme)))
+            item = Item(DUPLICATE, where,
                         detail="a second row for one address")
         else:
             item = classify_tile(z, col, row, data, scheme, decompress, limit)
@@ -440,15 +470,21 @@ def audit(entries, read, sample=DEFAULT_SAMPLE, limit=MAX_INFLATED,
           source=""):
     """Classify the files of an unpacked tree. entries yields (parts, path)
     and read(path) returns the file's bytes. A path of None marks a link or
-    special file, which is listed and never read. A second file at one
-    address, whatever its extension or zero padding, is a DUPLICATE."""
+    special file, which is listed and never read. A path that is an OSError
+    marks an entry or folder that could not be listed, and it is CORRUPT. A
+    second file at one address, whatever its extension or zero padding, is a
+    DUPLICATE."""
     report = Report("tree", source, None, "", sample)
     seen = set()
     for parts, path in entries:
         where = "/".join(parts)
         address = _tile_address(parts)
         key = address[:3] if address else None
-        if path is None:
+        if isinstance(path, OSError):
+            item = Item(CORRUPT, where, detail="could not be listed or "
+                        "inspected (%s)"
+                        % (path.strerror or type(path).__name__))
+        elif path is None:
             item = Item(SKIPPED, where, detail="link or special file")
         elif key is not None and key in seen:
             item = Item(DUPLICATE, where,
@@ -461,11 +497,13 @@ def audit(entries, read, sample=DEFAULT_SAMPLE, limit=MAX_INFLATED,
 
 
 def gate(report):
-    """The exit status. A run that identified nothing is not a clean run."""
-    findings = report.findings()
-    if report.counts[OK] == 0 and not findings:
-        return 4
-    return 1 if findings else 0
+    """The exit status. A run that identified nothing is not a clean run, and
+    neither is one whose format row names something it cannot compare."""
+    if report.findings():
+        return 1
+    unreadable = (report.declared is not None
+                  and report.declared not in KNOWN_FORMATS)
+    return 4 if report.counts[OK] == 0 or unreadable else 0
 
 
 def describe(report):
@@ -501,7 +539,13 @@ def describe(report):
         for text in report.samples.get("DECLARED", []):
             lines.append("    " + text)
     code = gate(report)
-    if code == 4:
+    if code == 4 and report.counts[OK]:
+        lines.append("VERDICT: nothing was compared with the format row. "
+                     "%d of %d %s were identified from their bytes, and %s "
+                     "is not a format mbunpack reads."
+                     % (report.counts[OK], report.total, unit,
+                        clean(report.declared)))
+    elif code == 4:
         lines.append("VERDICT: nothing was compared. %d %s read and none was "
                      "identified." % (report.total, unit))
     elif code == 1:
@@ -529,6 +573,10 @@ def describe(report):
 # I/O. Everything that opens a file or a database.
 # =============================================================================
 
+def _decode_text(raw):
+    return raw.decode("utf-8", "replace")
+
+
 def open_readonly(path):
     """Open an MBTiles file so that nothing can write to it, and so that
     SQLite makes no file beside it. mode=ro alone still creates a -wal and a
@@ -546,14 +594,22 @@ def open_readonly(path):
                           "merge them first, with the sqlite3 shell on a "
                           "copy." % (side, full))
     uri = "file:%s?mode=ro&immutable=1" % urllib.request.pathname2url(full)
-    return sqlite3.connect(uri, uri=True)
+    con = sqlite3.connect(uri, uri=True)
+    # SQLite raises on a text value that is not UTF-8, which would end the run
+    # at the first Latin-1 attribution or text tile_data. Read it with the bad
+    # bytes replaced instead.
+    con.text_factory = _decode_text
+    return con
 
 
 def read_metadata(con):
-    """The metadata table as a dict. A file without one has no metadata."""
+    """The metadata table as a dict. A file without one has no metadata. Any
+    other error, such as a table with the wrong columns, is raised."""
     try:
         return dict(con.execute("select name, value from metadata"))
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc):
+            raise
         return {}
 
 
@@ -564,8 +620,13 @@ def tile_rows(con):
 
 
 def declared_format(meta):
+    """The format row as one of KNOWN_FORMATS when it names one, else the text
+    of the row, or None when there is no row."""
     value = meta.get("format")
-    return None if value is None else str(value).strip().lower()
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    return FORMAT_ALIASES.get(text, text)
 
 
 def may_read(mode, folder_real, top):
@@ -576,23 +637,44 @@ def may_read(mode, folder_real, top):
     return stat.S_ISREG(mode) and (folder_real + os.sep).startswith(top)
 
 
+def is_junction(path):
+    """True when path is a Windows junction. os.walk enters one as if it were
+    a folder, and os.path.islink says False for it. A junction that points at
+    one of its own parents would be walked until the path is too long."""
+    try:
+        tag = getattr(os.lstat(path), "st_reparse_tag", 0)
+    except OSError:
+        return False
+    return tag == JUNCTION_TAG
+
+
 def tree_entries(root):
     """(parts, path) for every entry below root, in a fixed order. path is
-    None for a symbolic link, a special file or a file outside the tree, which
-    must not be opened: a FIFO would block the read and a link would read a
-    file the folder does not hold."""
+    None for a symbolic link, a junction, a special file or a file outside the
+    tree, which must not be opened: a FIFO would block the read and a link
+    would read a file the folder does not hold. path is the OSError when the
+    entry or its folder cannot be listed or inspected, so the caller can report
+    the tiles that were never seen. os.walk drops such a folder silently unless
+    it is given onerror."""
     top = os.path.join(os.path.normcase(os.path.realpath(root)), "")
-    for folder, dirs, files in os.walk(root):
+    failed = []
+    for folder, dirs, files in os.walk(root, onerror=failed.append):
         dirs.sort()
         real = os.path.normcase(os.path.realpath(folder))
-        linked = [d for d in dirs
-                  if os.path.islink(os.path.join(folder, d))]
+        linked = [d for d in dirs if os.path.islink(os.path.join(folder, d))
+                  or is_junction(os.path.join(folder, d))]
+        dirs[:] = [d for d in dirs if d not in linked]
         for name in sorted(files + linked):
             path = os.path.join(folder, name)
-            rel = os.path.relpath(path, root)
-            mode = os.lstat(path).st_mode
-            yield rel.split(os.sep), (path if may_read(mode, real, top)
-                                      else None)
+            parts = os.path.relpath(path, root).split(os.sep)
+            try:
+                mode = os.lstat(path).st_mode
+            except OSError as exc:
+                yield parts, exc
+                continue
+            yield parts, (path if may_read(mode, real, top) else None)
+    for exc in sorted(failed, key=lambda e: str(e.filename)):
+        yield os.path.relpath(str(exc.filename), root).split(os.sep), exc
 
 
 def read_file(path, cap=MAX_INFLATED + 1):
@@ -843,6 +925,13 @@ def _self_test(tmp):
           "field number zero is not a vector tile")
     check(not is_mvt(_tile(b"\x4b")) and not is_mvt(_tile(b"\x4e")),
           "a group or reserved wire type is not a vector tile")
+    check(not is_mvt(_tile(_layer(extra=b"\x00\x00"))),
+          "field number zero after a good name is not a vector tile  "
+          "<-- pinned defect")
+    check(not any(is_mvt(_tile(_layer(extra=bytes([tag]))))
+                  for tag in (0x33, 0x34, 0x36, 0x37)),
+          "a named layer that also holds a group or reserved wire type is "
+          "not a vector tile  <-- pinned defect")
     check(not is_mvt(_tile(b"\x0a\x01a\x31\x00")),
           "a fixed64 field that runs past the layer is not a vector tile")
     check(not is_mvt(_tile(b"\x0a\x05ab")),
@@ -914,6 +1003,17 @@ def _self_test(tmp):
             (2, 0, True, "a boolean row"), (2, None, 0, "a NULL column")):
         check(tile(z, col, row, FIXTURE_PNG).status == BADCOORD,
               "%s is BADCOORD, so no path is built from it" % label)
+    twice = unpack(iter([(2, 1, 1, FIXTURE_PNG), (2, 1, 1, FIXTURE_JPG),
+                         (2, 9, 9, b"x"), (2, 9, 9, b"x")]), "png")
+    again = unpack(iter([(2, 1, 1, FIXTURE_PNG), (2, 1, 1, FIXTURE_JPG)]),
+                   "png", scheme="tms")
+    check(twice.samples[DUPLICATE] == ["2/1/2  a second row for one address",
+                                       "2/9/9  a second row for one address"]
+          and again.samples[DUPLICATE] == [
+              "2/1/1  a second row for one address"],
+          "a DUPLICATE row is named with the same flipped y as every other "
+          "status, and an off-grid twin keeps its stored address  "
+          "<-- pinned defect")
     check(tile(30, 2 ** 30 - 1, 0, FIXTURE_PNG).status == OK,
           "zoom 30 and its last column are on the grid")
     check("outside the 4 x 4 grid of zoom 2"
@@ -977,9 +1077,31 @@ def _self_test(tmp):
           "BADCOORD")
     check(declared_format({"format": b"png"}) == "b'png'"
           and verdict("b'png'", FIXTURE_PNG).declared_bad == 0
-          and gate(verdict("jpeg", FIXTURE_PNG)) == 0,
-          "a format stored as a BLOB, or spelled jpeg, is compared with "
-          "nothing and the run still exits 0")
+          and gate(verdict("b'png'", FIXTURE_PNG)) == 4
+          and gate(verdict("image/tiff", FIXTURE_PNG)) == 4
+          and gate(verdict(None, FIXTURE_PNG)) == 0,
+          "a format row stored as a BLOB, or naming a format mbunpack does "
+          "not read, compares nothing and exits 4, not 0  <-- pinned defect")
+    check([declared_format({"format": v}) for v in
+           ("jpeg", " JPEG ", "image/png", "image/jpeg", "image/webp",
+            "png")] == ["jpg", "jpg", "png", "jpg", "webp", "png"],
+          "jpeg and the media types of the three image kinds are read as "
+          "the format they name  <-- pinned defect")
+    def row(text, *data):
+        return verdict(declared_format({"format": text}), *data)
+
+    check(row("jpeg", FIXTURE_JPG).declared_bad == 0
+          and gate(row("jpeg", FIXTURE_JPG)) == 0
+          and row("jpeg", FIXTURE_PNG).declared_bad == 1
+          and gate(row("image/png", _gz(FIXTURE_MVT))) == 1,
+          "a tileset that says jpeg is compared with its tiles, and a "
+          "mismatch under a media type exits 1  <-- pinned defect")
+    said = "\n".join(describe(verdict("image/tiff", FIXTURE_PNG)))
+    check("VERDICT: nothing was compared with the format row. 1 of 1 tile(s) "
+          "were identified from their bytes, and image/tiff is not a format "
+          "mbunpack reads." in said and "every tile" not in said,
+          "the verdict of a run with an unreadable format row says it "
+          "compared nothing")
 
     # ---- the examples are capped
     many = unpack(rows(*[(3, 0, i, b"x") for i in range(5)]), None, sample=2)
@@ -1047,6 +1169,17 @@ def _self_test(tmp):
     check(unread == [], "a file off the grid is not read")
     check(tree({"2/1/2.PNG": FIXTURE_PNG}).counts[MISNAMED] == 1,
           "the extension is compared exactly, .PNG is not .png")
+    check(tree({"2/1/2.jpeg": FIXTURE_JPG}).counts[OK] == 1
+          and tree({"2/1/2.jpeg.gz": _gz(FIXTURE_JPG)}).counts[OK] == 1
+          and tree({"2/1/2.jpeg": FIXTURE_PNG}).counts[MISNAMED] == 1
+          and tree({"2/1/2.jpg": FIXTURE_JPG}).counts[OK] == 1,
+          "a JPEG kept under .jpeg is named right, and .jpeg on a PNG is "
+          "still MISNAMED  <-- pinned defect")
+    check(clean("a\u202eb\u2028c\u2066d\u200e")
+          == "a\\u202eb\\u2028c\\u2066d\\u200e"
+          and clean("caf\u00e9 \u00ff") == "caf\u00e9 \u00ff",
+          "clean() shows direction overrides and line separators and keeps "
+          "ordinary non-ASCII text  <-- pinned defect")
     dups = tree({"3/1/1.png": FIXTURE_PNG, "3/1/1.jpg": FIXTURE_JPG,
                  "3/1/01.png": FIXTURE_PNG, "3/1/2.png": FIXTURE_PNG})
     check(dups.counts[OK] == 2 and dups.counts[DUPLICATE] == 2
@@ -1108,6 +1241,8 @@ def _self_test(tmp):
     check("VERDICT: every tile was identified from its bytes and agrees "
           "with the declared format." in "\n".join(
               describe(verdict("png", FIXTURE_PNG)))
+          and "does not read" not in "\n".join(
+              describe(verdict("png", FIXTURE_PNG)))
           and "bytes.\n" in "\n".join(describe(verdict(None, FIXTURE_PNG)))
           + "\n",
           "a clean run says so, and says less when no format was declared")
@@ -1150,7 +1285,9 @@ def _self_test(tmp):
           "a run that compared nothing says so")
     check("mbunpack: x: 1 file(s) read" in "\n".join(describe(
         tree({"2/1/2.png": FIXTURE_PNG}, source="x")))
-        and "scheme" not in describe(tree({"2/1/2.png": FIXTURE_PNG}))[0],
+        and "scheme" not in describe(tree({"2/1/2.png": FIXTURE_PNG}))[0]
+        and "declared format" not in "\n".join(describe(tree(
+            {"2/1/2.png": FIXTURE_PNG}))),
         "a tree report counts files and has no scheme")
 
     # ---- the CLI on real MBTiles files
@@ -1164,7 +1301,9 @@ def _self_test(tmp):
     out = fresh("out")
     code, stdout, stderr = run_cli([mixed])
     check(code == 0 and "VERDICT: every tile" in stdout and stderr == ""
-          and not os.path.exists(out),
+          and not os.path.exists(out) and "declared format: pbf" in stdout
+          and "DECLARED" not in stdout and "Check only" not in stdout
+          and "Refused" not in stdout and "wrote" not in stdout,
           "a check of a clean vector tileset exits 0 and writes nothing")
     check(hashlib.sha256(read_file(mixed)).hexdigest() == before
           and sorted(os.listdir(tmp)) == listing,
@@ -1246,6 +1385,104 @@ def _self_test(tmp):
           "a symbolic link to a file or a folder is listed and never read; "
           "this host made %d link(s)  <-- pinned defect" % len(made))
 
+    # A folder the walk cannot list. The first run uses the real operating
+    # system, and proves less where it will not deny access (Windows, root).
+    # The label does not say which, so the output is the same on every host.
+    deny = fresh("deny")
+    put(deny, "1/0/0.png", FIXTURE_PNG)
+    put(deny, "2/0/0.png", FIXTURE_PNG)
+    shut = os.path.join(deny, "2")
+    os.chmod(shut, 0)
+    denied_here = not os.access(shut, os.R_OK | os.X_OK)
+    try:
+        code, stdout, stderr = run_cli([deny])
+    finally:
+        os.chmod(shut, 0o755)
+    check((code == 1 and "CORRUPT 1" in stdout) if denied_here
+          else (code == 0 and "2 file(s) read" in stdout),
+          "a sub-folder that cannot be listed is CORRUPT and the run exits "
+          "1, never a clean 0  <-- pinned defect")
+
+    # The same two failures, made on every host: the walk reports a folder
+    # it cannot list, and lstat fails on one file.
+    real_walk = os.walk
+    real_lstat = os.lstat
+    sorted_dirs = []
+
+    def walk_with_error(top, onerror=None, **kw):
+        onerror(OSError(13, "Permission denied", os.path.join(top, "9")))
+        for folder, dirs, files in real_walk(top, onerror=onerror, **kw):
+            dirs[:] = sorted(dirs, reverse=True)
+            sorted_dirs.append(dirs)
+            yield folder, dirs, files
+
+    def lstat_denying(path, *args, **kw):
+        if path.endswith("1.png"):
+            raise OSError(13, "Permission denied", path)
+        return real_lstat(path, *args, **kw)
+
+    shaky = fresh("shaky")
+    for rel in ("1/0/0.png", "1/0/1.png", "2/0/0.png"):
+        put(shaky, rel, FIXTURE_PNG)
+    try:
+        os.walk = walk_with_error
+        os.lstat = lstat_denying
+        shaky_report = audit(tree_entries(shaky), read_file)
+    finally:
+        os.walk = real_walk
+        os.lstat = real_lstat
+    check(shaky_report.counts[CORRUPT] == 2 and shaky_report.counts[OK] == 2
+          and gate(shaky_report) == 1
+          and shaky_report.samples[CORRUPT] == [
+              "1/0/1.png  could not be listed or inspected (Permission "
+              "denied)", "9  could not be listed or inspected (Permission "
+              "denied)"]
+          and "every tile" not in "\n".join(describe(shaky_report)),
+          "a folder the walk cannot list, and a file lstat cannot inspect, "
+          "are each CORRUPT and named  <-- pinned defect")
+    check(sorted_dirs[0] == ["1", "2"],
+          "tree_entries lists the sub-folders of a folder in sorted order  "
+          "<-- pinned defect")
+
+    # A Windows junction is not entered. The pure test of the tag runs on
+    # every host, and the real junctions are made only where cmd exists, so
+    # the real run proves less elsewhere.
+    class FakeStat(object):
+        st_reparse_tag = JUNCTION_TAG
+
+    check(is_junction(os.path.join(tmp, "no-such-entry")) is False
+          and not is_junction(deny),
+          "a path that does not exist, and a plain folder, are not junctions")
+    real_lstat = os.lstat
+    try:
+        os.lstat = lambda path: FakeStat()
+        tagged = is_junction("anything")
+    finally:
+        os.lstat = real_lstat
+    check(tagged is True,
+          "an entry with the mount point reparse tag is a junction")
+    tree_root = fresh("junction-tree")
+    put(tree_root, "1/0/0.png", FIXTURE_PNG)
+    bounds = [(os.path.join(tree_root, "out"), outdir),
+              (os.path.join(tree_root, "1", "loop"), tree_root)]
+    made_junctions = [
+        os.name == "nt" and subprocess.call(
+            ["cmd", "/c", "mklink", "/J", link, target],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+        for link, target in bounds]
+    try:
+        junction_report = audit(tree_entries(tree_root), read_file)
+    finally:
+        # rmdir removes a junction and leaves its target alone.
+        removed = [os.rmdir(link) for (link, _), made in
+                   zip(bounds, made_junctions) if made]
+    check(junction_report.counts[OK] == 1
+          and junction_report.counts[SKIPPED] == sum(made_junctions)
+          and junction_report.total == 1 + sum(made_junctions)
+          and len(removed) == sum(made_junctions) and os.path.exists(outside),
+          "a junction to a folder outside the tree, and one back to a parent "
+          "of itself, are listed and not entered  <-- pinned defect")
+
     # The mbutil defect, reproduced as a tree: gzip under .png and .pbf.
     legacy = fresh("legacy")
     for rel, data in (("2/1/1.png", _gz(FIXTURE_MVT)),
@@ -1305,6 +1542,36 @@ def _self_test(tmp):
     check(code == 0 and "declared format: none" in stdout,
           "a file with no metadata table is read, and says it declared "
           "nothing")
+    latin = fresh("latin.mbtiles")
+    _make_mbtiles(latin, [(1, 0, 0, _gz(FIXTURE_MVT))], {"format": "png"})
+    con = sqlite3.connect(latin)
+    con.execute("insert into metadata values ('attribution', "
+                "cast(x'436166e9' as text))")
+    con.execute("insert into tiles values (1, 1, 0, cast(x'ff' as text))")
+    con.commit()
+    con.close()
+    latin_out = fresh("latin-out")
+    code, stdout, stderr = run_cli([latin, "--out", latin_out, "--apply"])
+    kept_meta = json.loads(_tree(latin_out)["metadata.json"].decode("utf-8"))
+    check(code == 1 and stderr == "" and "declared format: png" in stdout
+          and "DECLARED 1" in stdout and "CORRUPT 1" in stdout
+          and "tile_data is str, not a blob" in stdout
+          and kept_meta == {"format": "png",
+                            "attribution": "Caf" + chr(0xFFFD)},
+          "a metadata value and a tile_data that are not UTF-8 do not end "
+          "the run: the format row is still read and compared, the tile is "
+          "CORRUPT, and metadata.json keeps the row  <-- pinned defect")
+    badcols = fresh("badcols.mbtiles")
+    con = sqlite3.connect(badcols)
+    con.execute("create table metadata (k text, v text)")
+    con.execute("create table tiles (zoom_level integer, tile_column "
+                "integer, tile_row integer, tile_data blob)")
+    con.commit()
+    con.close()
+    code, stdout, stderr = run_cli([badcols])
+    check(code == 2 and "no such column" in stderr and stdout == "",
+          "a metadata table with the wrong columns exits 2 and is not read "
+          "as an empty one  <-- pinned defect")
     empty = fresh("empty.mbtiles")
     _make_mbtiles(empty, [], {"format": "png"})
     refused_out = fresh("refused")
@@ -1452,6 +1719,18 @@ def _self_test(tmp):
                                          "2/2/2.mvt.gz"],
           "a write that fails after the tiles exits 2 and leaves the files "
           "already written")
+    huge = fresh("huge")
+    put(huge, "0/0/0.png", PNG_SIGNATURE)
+    with open(os.path.join(huge, "0", "0", "0.png"), "r+b") as handle:
+        handle.truncate(MAX_INFLATED + 10)
+    code, stdout, stderr = run_cli([huge])
+    check(code == 1 and "CORRUPT 1" in stdout
+          and "larger than %d bytes" % MAX_INFLATED in stdout
+          and "every tile" not in stdout,
+          "a tile file of 64 MiB and ten bytes, with a PNG signature, is "
+          "refused by the real reader and the real limit, not named png  "
+          "<-- pinned defect")
+    os.remove(os.path.join(huge, "0", "0", "0.png"))
     got = fresh("cap.bin")
     with open(got, "wb") as handle:
         handle.write(b"0123456789")
@@ -1477,7 +1756,7 @@ def _self_test(tmp):
         [sys.executable, os.path.abspath(__file__), odd],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         env=dict(os.environ, PYTHONIOENCODING="ascii"))
-    check(child.returncode == 0 and b"declared format: ?," in child.stdout
+    check(child.returncode == 4 and b"declared format: ?," in child.stdout
           and b"Traceback" not in child.stderr,
           "a metadata value the console cannot encode prints as ? and the "
           "verdict still arrives  <-- pinned defect")
