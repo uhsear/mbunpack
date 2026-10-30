@@ -52,7 +52,7 @@ import subprocess
 import sys
 import tempfile
 import traceback
-import urllib.request
+import urllib.parse
 import zlib
 
 # =============================================================================
@@ -102,7 +102,7 @@ MEANING = {
     UNKNOWN: "bytes match no format mbunpack reads",
     CORRUPT: "the bytes, or a folder, cannot be read",
     BADCOORD: "tile address is not a cell of the tile grid",
-    DUPLICATE: "a second tile for one address, the later copy is not used",
+    DUPLICATE: "a second tile for one address, only the first copy is used",
     MISNAMED: "file name disagrees with the bytes inside it",
     SKIPPED: "not z/x/y.ext, or a link or special file, so it was not read",
 }
@@ -509,7 +509,8 @@ def gate(report):
 def describe(report):
     """The report as a list of lines."""
     unit = "tile(s)" if report.mode == "tileset" else "file(s)"
-    head = "mbunpack: %s: %d %s read" % (report.source, report.total, unit)
+    head = "mbunpack: %s: %d %s read" % (clean(report.source), report.total,
+                                         unit)
     if report.mode == "tileset":
         head += ", scheme %s" % report.scheme
     lines = [head]
@@ -577,6 +578,19 @@ def _decode_text(raw):
     return raw.decode("utf-8", "replace")
 
 
+def sqlite_uri(full, sep=os.sep):
+    """The read-only immutable SQLite URI of an absolute path. The authority
+    is always empty, so a UNC path becomes file:////host/share/x and a POSIX
+    path with two leading slashes becomes file:////x. pathname2url returns
+    //host/share on Python 3.12 and later, which SQLite reads as the
+    authority "host" and refuses. sep is the path separator to turn into /."""
+    text = full.replace(sep, "/")
+    if not text.startswith("/"):
+        text = "/" + text
+    return "file://%s?mode=ro&immutable=1" % urllib.parse.quote(text,
+                                                                safe="/:")
+
+
 def open_readonly(path):
     """Open an MBTiles file so that nothing can write to it, and so that
     SQLite makes no file beside it. mode=ro alone still creates a -wal and a
@@ -593,8 +607,7 @@ def open_readonly(path):
                           "reads the main file only and writes nothing, so "
                           "merge them first, with the sqlite3 shell on a "
                           "copy." % (side, full))
-    uri = "file:%s?mode=ro&immutable=1" % urllib.request.pathname2url(full)
-    con = sqlite3.connect(uri, uri=True)
+    con = sqlite3.connect(sqlite_uri(full), uri=True)
     # SQLite raises on a text value that is not UTF-8, which would end the run
     # at the first Latin-1 attribution or text tile_data. Read it with the bad
     # bytes replaced instead.
@@ -932,6 +945,10 @@ def _self_test(tmp):
                   for tag in (0x33, 0x34, 0x36, 0x37)),
           "a named layer that also holds a group or reserved wire type is "
           "not a vector tile  <-- pinned defect")
+    check(not any(is_mvt(_tile(_layer(extra=bytes([tag]) + b"\x00" * 4)))
+                  for tag in (0x33, 0x34, 0x36, 0x37)),
+          "a group or reserved wire type is refused even when four bytes "
+          "follow it  <-- pinned defect")
     check(not is_mvt(_tile(b"\x0a\x01a\x31\x00")),
           "a fixed64 field that runs past the layer is not a vector tile")
     check(not is_mvt(_tile(b"\x0a\x05ab")),
@@ -1283,6 +1300,14 @@ def _self_test(tmp):
     check("VERDICT: nothing was compared. 0 tile(s) read"
           in "\n".join(describe(unpack(rows(), "png"))),
           "a run that compared nothing says so")
+    check("identified from the bytes" not in "\n".join(describe(
+        unpack(rows(), "png"))),
+        "a run that identified nothing has no identified heading")
+    odd_head = describe(tree({"2/1/2.png": FIXTURE_PNG},
+                             source="d\x1b[2J\x07x"))[0]
+    check(odd_head == "mbunpack: d\\x1b[2J\\x07x: 1 file(s) read",
+          "the source path in the first line is printed with its control "
+          "characters shown  <-- pinned defect")
     check("mbunpack: x: 1 file(s) read" in "\n".join(describe(
         tree({"2/1/2.png": FIXTURE_PNG}, source="x")))
         and "scheme" not in describe(tree({"2/1/2.png": FIXTURE_PNG}))[0]
@@ -1497,8 +1522,10 @@ def _self_test(tmp):
           and "expected .mvt.gz" in stdout and "2/1/1.png" in stdout,
           "an audit finds gzip vector tiles under .png and .pbf and exits 1  "
           "<-- pinned defect")
-    check(run_cli([fresh("nothing-here")])[0] == 2,
-          "a path that does not exist exits 2")
+    code, stdout, stderr = run_cli([fresh("nothing-here")])
+    check(code == 2 and "is not a file or a directory" in stderr,
+          "a path that does not exist exits 2 and says it is not a file or "
+          "a directory")
     hollow = fresh("hollow-dir")
     os.mkdir(hollow)
     check(run_cli([hollow])[0] == 4,
@@ -1691,6 +1718,26 @@ def _self_test(tmp):
     code, stdout, stderr = run_cli([weird_file])
     check(code == 0 and "1 tile(s) read" in stdout,
           "a directory name with #, a space and %20 in it opens  "
+          "<-- pinned defect")
+    unc = "\\\\host\\share\\a b\\x.mbtiles"
+    check(sqlite_uri(unc, "\\")
+          == "file:////host/share/a%20b/x.mbtiles?mode=ro&immutable=1"
+          and sqlite_uri("C:\\d #\\x.mbtiles", "\\")
+          == "file:///C:/d%20%23/x.mbtiles?mode=ro&immutable=1"
+          and sqlite_uri("//tmp/a\\b", "/")
+          == "file:////tmp/a%5Cb?mode=ro&immutable=1",
+          "a UNC path, a drive path and a POSIX path with two leading "
+          "slashes each become a URI with an empty authority  "
+          "<-- pinned defect")
+    # The administrative share of the drive on Windows, two leading slashes
+    # on POSIX. A host without that path opens the plain path, so the
+    # assertion runs on every host.
+    share = ("\\\\localhost\\" + weird_file[0] + "$" + weird_file[2:]
+             if os.name == "nt" else "/" + weird_file)
+    code, stdout, stderr = run_cli([share if os.path.isfile(share)
+                                    else weird_file])
+    check(code == 0 and "1 tile(s) read" in stdout,
+          "a file reached through a UNC path or two leading slashes opens  "
           "<-- pinned defect")
     con = open_readonly(weird_file)
     refusal = ""
@@ -1958,7 +2005,8 @@ def _run(argv):
               "--decompress go with an .mbtiles file.", file=sys.stderr)
         return 64
     if not is_tree and not os.path.isfile(args.source):
-        print("error: %s is not a file or a directory." % args.source,
+        print("error: %s is not a file or a directory."
+              % clean(args.source),
               file=sys.stderr)
         return 2
     if args.out and os.path.exists(args.out) and (
@@ -1966,7 +2014,7 @@ def _run(argv):
         # Checked on a dry run too, so the run that would mix into a folder
         # says so before --apply is added.
         print("error: --out %s exists and is not an empty directory. Name a "
-              "new one." % args.out, file=sys.stderr)
+              "new one." % clean(args.out), file=sys.stderr)
         return 64
 
     try:
@@ -1984,13 +2032,13 @@ def _run(argv):
     if args.out:
         if not args.apply:
             print("\nCheck only. %s was not written. Re-run with --apply."
-                  % args.out)
+                  % clean(args.out))
         elif report.counts[OK]:
             print("\nwrote %d tile(s) and metadata.json under %s"
-                  % (report.counts[OK], args.out))
+                  % (report.counts[OK], clean(args.out)))
         else:
             print("\nRefused. %s was not written, because no tile was "
-                  "identified." % args.out)
+                  "identified." % clean(args.out))
     return gate(report)
 
 
